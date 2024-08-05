@@ -1,0 +1,211 @@
+import streamlit as st
+import os
+import json
+import shutil
+from dotenv import load_dotenv
+import pandas as pd
+from langchain_community.document_loaders import DirectoryLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.embeddings import OllamaEmbeddings
+from langchain.vectorstores import Chroma
+from langchain.chains import RetrievalQA
+from langchain.llms import Ollama
+from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
+
+DOCUMENTS_DIR = 'documents/'
+
+def embed(comments, company_name, modal, selected_points, tone, length):
+    load_dotenv()
+    ollama_base_url = os.getenv('BASE_URL')
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    vectorstore = None
+    
+    loader = DirectoryLoader(DOCUMENTS_DIR)
+    data = loader.load()
+
+    # Split the documents into smaller chunks
+    all_splits = text_splitter.split_documents(data)
+    
+    if modal == "ollama":
+        oembed = OllamaEmbeddings(base_url=ollama_base_url, model="nomic-embed-text")
+        vectorstore = Chroma.from_documents(documents=all_splits, embedding=oembed, collection_name="ollama")
+        llm = Ollama(base_url=ollama_base_url, model="llama3")
+    elif modal == "azureopen_AI":
+        llm = AzureChatOpenAI(
+            azure_deployment="msgen4o",
+            api_version="2024-05-01-preview",
+            model_version="0301",
+        )
+        embeddings = AzureOpenAIEmbeddings(
+            azure_deployment="text-embedding-3-large",
+            openai_api_version="2023-05-15",
+        )
+        vectorstore = Chroma.from_documents(documents=all_splits, embedding=embeddings)
+    else:
+        raise ValueError("Incorrect modal name")
+    
+    points_str = "\n".join(selected_points)
+
+    qachain = RetrievalQA.from_chain_type(llm, retriever=vectorstore.as_retriever())
+    question = f"""Your are an expert business analyst. Your job is to create a beautiful Business Requirements Document for a prospective customer.
+    Here I am giving points and descriptions about them that you need to find and generate from the given context. You need to generate and include content for each of the points mentioned below in the final response.
+    
+    **Points**:
+    Business Requirements Document (BRD)
+    * Introduction
+        {points_str}
+    
+    ------- page end
+    
+    From the above example, get details for each point from the context and write a description and detail about each point mentioned above. Also, consider additional comments while generating the response. Follow the instructions given in comments as well.
+    
+    **Comments**: {comments}
+    
+    While generating the BRD, please consider the output tone required for the user. For example, if the user selected a Professional tone, make sure that the language of the BRD should feel professional.
+
+    **Tone needed for BRD**: {tone}
+
+    If the user asks for a description length of large, then describe it in 80-100 words. If the length is medium, describe it in 60-80 words, and if the length is small, describe it in 40-60 words.
+    
+    **The length of the description of each point should be**: {length}
+    
+    Rules to follow for output response:
+    1. Describe more for each point mentioned above
+    2. Use crisp and clear language
+    3. Keep it more humanized and easily readable
+    4. Use proper grammar and spelling
+    5. Use headings, subheadings, and bullet points where needed
+    6. Make it more descriptive
+    7. All points mentioned above should come in the form of headings
+    8. Strictly follow the comments given above"""
+
+    jsonquestion = """You are an expert business analyst. Analyze the business requirements for a prospective customer, detailing the points below. Return the response as a JSON string.
+
+    Points:
+    1. Business Requirements: List specific business requirements elicited from stakeholders, categorized by both priority and area of functionality. Include links to use case documentation and other key reference materials to make the requirements complete and understandable. Incorporate both functional and non-functional requirements into a traceability matrix for the project's duration.
+
+    1. Functional Requirements
+        - General / Base Functionality
+        - Security Requirements
+        - Reporting Requirements
+        - Usability Requirements
+        - Audit Requirements
+
+    2. Non-Functional Requirements: Include technical and operational requirements that are not specific to a function, such as processing time, concurrent users, availability, etc.
+
+    The JSON response should include:
+    - Requirement_number
+    - priority_level
+    - description
+    - rational
+    - impacted_stakeholder
+
+    Structure the JSON response with separate keys for functional and non-functional requirements as follows:
+    {
+        "functional": [
+        {
+            "Requirement_number": "response generated by AI, example: FR-01",
+            "priority_level": "response generated by AI",
+            "description": "response generated by AI",
+            "rational": "response generated by AI",
+            "impacted_stakeholder": "response generated by AI"
+        },
+        ...
+        ],
+        "non-functional": [
+        {
+            "Requirement_number": "response generated by AI example: NFR-01",
+            "priority_level": "response generated by AI",
+            "description": "response generated by AI",
+            "rational": "response generated by AI",
+            "impacted_stakeholder": "response generated by AI"
+        },
+        ...
+        ]
+    }
+
+    Rules:
+    1. Keep key names constant in the final response.
+    2. Do not add any text except the JSON string.
+    3. The response must be strictly in JSON format.
+    4. Do not include introductory or explanatory text.
+    5. Avoid using markdown or special formatting in the JSON string.
+
+    Ensure the final output is a pure JSON string only."""
+
+    docs = vectorstore.similarity_search(question)
+    response = qachain.invoke({"query": question})
+    jsonresponse = qachain.invoke({"query": jsonquestion})
+
+    return jsonresponse, response
+
+brd_points = [
+    "*: Project Summary - [These should describe the overall goal in developing the product, high level descriptions of what the product will do, how they are aligned to business objectives, and the requirements for interaction with other systems.]",
+    "*: Background - [Provide a brief history of how the project came to be proposed and initiated, including the business issues/problems identified, and expected benefit of implementing the project/developing the product.]",
+    "*: Business Drivers - [List the business drivers that make development of this product important. These can be financial, operational, market or environmental.]",
+    "*: Project Scope - [Describe what work is in scope for the project, and specifically what work is out of scope… beyond the current budget, resources and timeline as approved by the project stakeholders. This is designed to prevent “scope creep” of additional features and functions not originally anticipated.]",
+    "*: In Scope Functionality",
+    "*: Out of Scope Functionality",
+    "*: System Perspective - [Provide a complete description of the factors that could prevent successful implementation or accelerate the projects, particularly factors related to legal and regulatory compliance, existing technical or operational limitations in the environment, and budget/resource constraints.]",
+    "*: Assumptions",
+    "*: Constraints",
+    "*: Risks",
+    "*: Issues",
+    "*: List of Acronyms - [If needed, create a list of acronyms used throughout the BRD document to aid in comprehension.]",
+    "*: Glossary of Terms - [If needed, identify and define any terms that may be unfamiliar to readers, including terms that are unique to the organization, the technology to be employed, or the standards in use.]",
+    "*: Related Documents - [Provide a list of documents or web pages, including links, which are referenced in the BRD.]"
+]
+
+def display_dynamic_table(json_data):
+    def render_table_header(df):
+        return [col.replace('_', ' ') for col in df.columns]
+
+    def render_table_rows(df):
+        return df.values.tolist()
+
+    for type_ in json_data.keys():
+        st.subheader(f"{type_.capitalize()} Requirements")
+        
+        # Convert JSON data to DataFrame
+        df = pd.DataFrame(json_data[type_])
+        
+        # Display table
+        st.table(df)
+
+st.set_page_config(layout="wide")
+
+
+st.title("Nexa AI")
+st.text("Generate The Business Requirement Document")
+st.sidebar.subheader("Input Details")
+uploaded_files = st.sidebar.file_uploader("Choose files", accept_multiple_files=True)
+company_name = st.sidebar.text_input("Company Name")
+comments = st.sidebar.text_area("Comments")
+modal = st.sidebar.selectbox("Model Type", ["ollama", "azureopen_AI"])
+tone = st.sidebar.selectbox("Select Tone for your BRD", ["Professional", "Casual", "Formal"])
+length = st.sidebar.selectbox("Select Length for BRD Descriptions", ["Small", "Medium", "Large"])
+# selected_points = st.sidebar.multiselect("Select Points for BRD", brd_points)
+
+select_all = st.sidebar.checkbox("Select All Points")
+selected_points = st.sidebar.multiselect(
+    "Select Points for BRD", brd_points, default=brd_points if select_all else []
+)
+
+if st.sidebar.button("Generate BRD"):
+    if not company_name or not comments or not selected_points or not uploaded_files:
+        st.error("Please provide all inputs!")
+    else:
+        if os.path.exists(DOCUMENTS_DIR):
+            shutil.rmtree(DOCUMENTS_DIR)
+        os.makedirs(DOCUMENTS_DIR, exist_ok=True)
+
+        for uploaded_file in uploaded_files:
+            file_path = os.path.join(DOCUMENTS_DIR, uploaded_file.name)
+            with open(file_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+
+        json_output, response = embed(comments, company_name, modal, selected_points, tone, length)
+        st.subheader("Generated Business Requirements Document")
+        st.write(response["result"])
+        display_dynamic_table(json.loads(json_output["result"]))
+
